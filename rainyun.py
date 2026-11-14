@@ -15,7 +15,13 @@ import cv2
 import ddddocr
 import requests
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    ElementNotInteractableException,
+    StaleElementReferenceException,
+    TimeoutException,
+    WebDriverException,
+)
 from selenium.webdriver import ActionChains
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -553,6 +559,40 @@ def get_element_size(element) -> tuple[float, float]:
     return float(width), float(height)
 
 
+def refresh_captcha(ctx: RuntimeContext) -> bool:
+    """在当前验证码 iframe 内可靠刷新，保留原识别流程。"""
+    try:
+        wait_seconds = max(5, min(10, getattr(ctx.wait, "_timeout", 10)))
+        wait = WebDriverWait(ctx.driver, wait_seconds, poll_frequency=0.25)
+        reload_locator = (By.XPATH, '//*[@id="reload"]')
+
+        try:
+            reload_btn = wait.until(EC.element_to_be_clickable(reload_locator))
+            ctx.driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center', inline:'center'});", reload_btn
+            )
+            try:
+                reload_btn.click()
+            except (
+                ElementNotInteractableException,
+                ElementClickInterceptedException,
+                StaleElementReferenceException,
+                WebDriverException,
+            ):
+                reload_btn = wait.until(EC.presence_of_element_located(reload_locator))
+                ctx.driver.execute_script("arguments[0].click();", reload_btn)
+        except TimeoutException:
+            # 刷新动画期间按钮可能暂时不可点击，保留 DOM 事件兜底。
+            reload_btn = wait.until(EC.presence_of_element_located(reload_locator))
+            ctx.driver.execute_script("arguments[0].click();", reload_btn)
+
+        wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="slideBg"]')))
+        return True
+    except (TimeoutException, WebDriverException) as refresh_error:
+        logger.error(f"无法刷新验证码: {type(refresh_error).__name__}: {refresh_error}")
+        return False
+
+
 def process_captcha(ctx: RuntimeContext, retry_count: int = 0) -> bool:
     """处理验证码"""
     if retry_count >= CAPTCHA_RETRY_LIMIT:
@@ -643,24 +683,17 @@ def process_captcha(ctx: RuntimeContext, retry_count: int = 0) -> bool:
             logger.error("当前验证码识别率低")
         
         # 刷新验证码重试
-        reload_btn = ctx.driver.find_element(By.XPATH, '//*[@id="reload"]')
-        time.sleep(2)
-        reload_btn.click()
-        time.sleep(2)
-        
+        if not refresh_captcha(ctx):
+            return False
+
         return process_captcha(ctx, retry_count + 1)
         
     except (TimeoutException, ValueError, CaptchaRetryableError) as e:
         logger.error(f"验证码处理异常: {type(e).__name__}: {e}")
         
-        try:
-            reload_btn = ctx.driver.find_element(By.XPATH, '//*[@id="reload"]')
-            time.sleep(2)
-            reload_btn.click()
-            time.sleep(2)
+        if refresh_captcha(ctx):
             return process_captcha(ctx, retry_count + 1)
-        except Exception as refresh_error:
-            logger.error(f"无法刷新验证码: {refresh_error}")
+        else:
             return False
 
 
